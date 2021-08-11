@@ -1,0 +1,403 @@
+##############################
+#
+# Explore (KNOW) your data
+#
+# 7.2.2021 SDC
+#
+##############################
+library(tictoc)
+library(tidyverse)
+library(lubridate)
+library(purrr)
+library(odbc)
+library(tsibble)
+library(glue)
+library(readr)
+library(naniar)
+library(Hmisc)
+library(DescTools)
+library(DataExplorer)
+library(pROC)
+
+project_dir = Sys.getenv("project_dir")
+communal_data_dir = Sys.getenv("communal_data_dir")
+# get data, same as it ever was
+# good practice to set time zone
+Sys.setenv(TZ='America/New_York')
+set.seed(1970)
+
+
+source(glue("{project_dir}/src/TRUST_DATA_SUBFUN.R"))
+
+
+data_warehouse_con <- DBI::dbConnect(odbc::odbc(), 
+                                     Driver = "SQLServer", 
+                                     Server = Sys.getenv("data_warehouse_server"), 
+                                     Database = Sys.getenv("data_warehouse_database"), 
+                                     UID = Sys.getenv("data_warehouse_uid"), 
+                                     PWD = Sys.getenv("data_warehouse_pwd")
+)
+
+# ora, for A#s
+
+oracon <- DBI::dbConnect(odbc::odbc(),
+                         Driver = "Oracle",
+                         Host   = Sys.getenv('oracle_host'),
+                         SVC    = Sys.getenv('oracle_svc'),
+                         UID    = Sys.getenv('oracle_uid'),
+                         PWD    = Sys.getenv('oracle_pwd'),
+                         Port   = 1521)
+
+NOTES_FROM_DAN <- "
+
+Use A#! (US ONLY!)
+
+"
+custs <- get_oracle_customers(oracon) %>% 
+  filter(!is.na(ACCT_NBR))
+
+start_date <- ymd('2018-7-01')
+end_date <- ymd('2021-06-30')
+
+#######################
+## Sales data cleaning
+##########################
+month_sales <- get_historical_daily_money_data(data_warehouse_con, start_date, end_date,
+                                               T, # neg 
+                                               T, # open
+                                               F # internal
+                                               )
+
+month_sales <- month_sales %>% 
+  filter(shipCustomerNumberDesc %in% unique(custs$CUST_NBR))
+
+# get A#
+month_sales <- 
+  month_sales %>% 
+  left_join(custs %>% select(CUST_NBR, ACCT_NBR), by = c('shipCustomerNumberDesc' = 'CUST_NBR')) 
+### quarterly sales
+
+quarterly_sales <- month_sales %>% 
+  mutate(year_quarter = ymd(orderDate))%>%
+  mutate(year_quarter = yearquarter(year_quarter)) %>% 
+group_by(year_quarter, ACCT_NBR) %>% 
+  summarise(Qty = sum(Qty),
+            Value = sum(Value))  
+
+head(quarterly_sales)
+
+#############################
+## Trust data cleaning
+##############################
+# nonstock in gen about 2% of items
+trusts_dat = get_trust_data(data_warehouse_con, start_date, end_date)
+head(trusts)
+# is the late stock a good rule? DLS says: yes!
+trusts <- trusts_dat %>% 
+  mutate(days_to_ship = time_length(lubridate::interval(ORIGINAL_ORDER_DATE, SHIP_DATE), "days")) %>% 
+  filter(STANDARD_SHIP_VIA != 'CANCEL')
+head(trusts)
+
+### Changed because before it did not filter
+trusts <- trusts %>% filter(STOCK_NONSTOCK == 'STOCK' & SHIP_DATE != ORIGINAL_ORDER_DATE)
+dim(trusts)
+# filter out SHIP_VIA DROP SHIP
+
+# multiple lateness categories?
+
+# check and see is the variation re: how customers are impacted, also
+
+trusts <- trusts %>% 
+  mutate(order_month = yearmonth(ORIGINAL_ORDER_DATE),
+         expedited = SHIP_VIA != '' & SHIP_VIA != STANDARD_SHIP_VIA,
+         late = STOCK_NONSTOCK == 'STOCK' & SHIP_DATE != ORIGINAL_ORDER_DATE & days_to_ship > 1)
+
+# 2% SHIPPED != SHIPPED_CMI
+# 3% order qty != ship qty
+# super simple
+## Add account number
+
+### No duplicate customer numbers in the customer data set
+trusts <- trusts  %>% 
+  left_join(custs %>% select(CUST_NBR, ACCT_NBR), by = c('CUST_SHIP_ID' = 'CUST_NBR'))
+
+###############################
+## Complaints cleaning
+####################################
+complaints_dat = get_complaint_data(data_warehouse_con, start_date, end_date)
+complaints = complaints_dat
+# HOLD???
+
+### Assuming "Customer ID (Entity)" is who we join complaints data to other trust data
+colnames(complaints)[1] = "CUST_NBR"
+## Remove missing customer ID entity from the data set so you don't join on them later
+complaints = complaints %>%
+  drop_na(CUST_NBR)
+### Combine complaints data with custs list so we can get A numbers
+complaints = complaints %>%
+  left_join(custs %>% select(CUST_NBR, ACCT_NBR), by = c('CUST_NBR'))
+### Remove the missing A numbers
+complaints_dat = complaints_dat %>%
+  drop_na(ACCT_NBR)
+
+
+head(complaints_dat)
+### Aggregate by every three months
+### Removaints_dat$`Date Opened` = ymd(complaints_dat$`Date Opened`)
+complaints_dat$year_quarter = yearquarter(complaints_dat$`Date Opened`) 
+head(complaints_dat)
+
+complaints_dat = complaints_dat %>%
+  select(CUST_NBR, ACCT_NBR,quarter, Reportable) %>%
+  ### Every event if_else so get the number of complaints
+  mutate(complaints = rep(1, dim(complaints_dat)[1])) %>%
+  mutate(adverse_events = if_else(Reportable == "Yes", 1, 0)) %>%
+  group_by(year_quarter, ACCT_NBR) %>%
+  summarise(adverse_events = sum(adverse_events), 
+            complaints = sum(complaints))
+complaints_dat
+
+
+
+
+### I don't think there are repeats here 
+head(trusts_complaints)
+### Create the percents for late and expedited per month
+
+head(trust_aggs)
+sum(duplicated(trust_aggs$ACCT_NBR))
+sum()
+# low orders not interesting
+trust_aggs
+
+
+# fewer expedited I guess
+## Match on two criteria order_month and ACC_NBR
+trust_aggs <- trust_aggs %>% 
+  left_join(month_sales, by = c("order_month" = "order_month",
+                                "ACCT_NBR" = "ACCT_NBR"))
+
+rcorr(as.matrix(trust_aggs %>% select(-order_month,-ACCT_NBR)), type = "spearman")
+### Get CI for sales and trust
+#round(SpearmanRho(trust_global_sales_complete$sales, trust_global_sales_complete$trust, conf.level = .95),2)
+
+# try some time-series based stuff!
+
+# customers, last 12 mo val.
+
+cval <- trust_aggs %>% 
+  filter(order_month >= yearmonth('2020-07-01')) %>% 
+  group_by(ACCT_NBR) %>% 
+  summarise(Value = sum(Value)) %>% 
+  ungroup() %>% 
+  arrange(-Value) %>% 
+  mutate(cum_pct = cumsum(Value))
+
+cval
+#A000000260
+# for pareto type things - say we drop bottom 10%
+cval$cum_pct = cval$cum_pct/sum(cval$Value, na.rm = TRUE)
+
+# save it for layta
+
+saveRDS(trust_aggs, glue("{communal_data_dir}/trust_data/trust3yr.rds"))
+
+# now for the old favorite, time series but then blow it out
+
+tic("Time series manips")
+### Changing this to tibble
+rawtee <- as_tsibble(trust_aggs, key = ACCT_NBR, index = order_month)
+sum(has_gaps(rawtee, .full = TRUE)$.gaps)
+
+rgaps <- rawtee %>%
+  count_gaps(.full = TRUE)
+rgaps
+
+# A tibble: 35,597 x 4
+#ACCT_NBR      .from      .to    .n
+#<chr>         <mth>    <mth> <int>
+#  1 A000000260 2019 Dec 2019 Dec     1
+#2 A000000260 2020 May 2021 Jun    14
+# good place to filter 'dead' customer data maybe, or...fill all gaps but last
+
+# could also find, say, histogram of internal gaps.
+### When a customer does not have an order during a particulary month we fill in with zeros
+rawtee <- rawtee %>%
+  fill_gaps(Qty = 0,
+            Value = 0,
+            orders = 0,
+            late_n = 0,
+            expedited_n = 0,
+            late_pct = 0,
+            expedited_pct = 0)
+
+toc()
+head(rawtee)
+# lag feats
+### Created lagged variable by one, two, and three months.
+feats <- rawtee %>% 
+  group_by(ACCT_NBR) %>% 
+  arrange(order_month) %>% 
+  mutate(late_pct_1 = lag(late_pct,1),
+         late_pct_2 = lag(late_pct,2),
+         late_pct_3 = lag(late_pct,3),
+         expedited_pct_1 = lag(expedited_pct,1),
+         expedited_pct_2 = lag(expedited_pct,2),
+         expedited_pct_3 = lag(expedited_pct,3),
+         ### Differneces gives the most recent value subtracted from the previously as defined by the data set in this case one month
+         ## Lag gives the value from the period below unless otherwise specifcied
+         ### Therefore sales difference is the percentage change the current relative to the previous
+         sales_diff = difference(Value)/(ifelse(lag(Value) == 0, 1,lag(Value))),
+         ## Sales returns is the logged difference 
+         sales_returns = difference(log(ifelse(Value > 1, Value,  1)))
+  )
+
+
+
+# use Data Explorer!
+
+feats$logSales <- log(ifelse(feats$Value > 0, feats$Value,1))
+
+saveRDS(feats, glue("{communal_data_dir}/trust_data/trustfeats_3yr.rds"))
+
+config <- configure_report(
+  add_plot_str = TRUE,# weird but show cols
+  add_plot_qq = TRUE,
+  add_plot_prcomp = FALSE,
+  add_plot_scatterplot = TRUE,
+  add_plot_bar = TRUE,
+  add_plot_correlation = TRUE,
+  global_ggtheme = quote(theme_minimal(base_size = 14))
+)
+
+create_report(feats, config = config) 
+
+# modellin'
+
+mod_data <- tibble(feats[complete.cases(feats),])
+dim(mod_data)
+
+### What does this do takes the first 100 customers?
+mod_data <- mod_data %>% 
+  filter(ACCT_NBR %in% head(cval$ACCT_NBR, 100))
+# if you just include top customers, no difference.
+############ Modeling with just the original indicators no lagging
+
+mod_percentage_sales <- lm(sales_diff ~ late_pct + expedited_pct, data = mod_data)
+summary(mod_percentage_sales)
+
+mod_diff_logged_sales = lm(sales_returns ~ late_pct + expedited_pct, data = mod_data)
+
+summary(mod_diff_logged_sales) 
+
+mod_logged_sales = lm(logSales ~ late_pct + expedited_pct, data = mod_data)
+
+summary(mod_logged_sales)
+
+####### Modeling three month data instead of monthly
+mod_data_quarter = mod_data %>%
+  mutate(year_quarter = yearquarter(order_month)) %>%
+  select(order_month, year_quarter, ACCT_NBR, orders, late_n, expedited_n, Value, Qty)
+mod_data_quarter 
+### Group data by quarter
+mod_data_quarter = mod_data_quarter %>%
+  group_by(year_quarter, ACCT_NBR) %>%
+  summarise(Qty = sum(Qty),
+            Value = sum(Value),
+            orders = n(),
+            late_n = sum(late),
+            expedited_n = sum(expedited),
+            late_pct = mean(late),
+            expedited_pct = mean(expedited))
+
+### Created  percentage changed, differenced, and logged
+### The idea would be to create a cut point of when a customer has zero sales 
+mod_data_quarter = mod_data_quarter %>%
+  mutate(sales_diff = difference(Value)/(ifelse(lag(Value) == 0, 1,lag(Value)))) %>%
+## Sales returns is the logged difference 
+  mutate(sales_returns = difference(log(ifelse(Value > 1, Value,  1)))) %>%
+  mutate(logSales = log(ifelse(Value > 0, Value,1)))
+mod_data_quarter
+
+### Create percentages
+head(mod_data_quarter)
+
+trust_aggs <- trusts %>% 
+  group_by(order_month, ACCT_NBR) %>% 
+  summarise(orders = n(),
+            late_n = sum(late),
+            expedited_n = sum(expedited),
+            late_pct = mean(late),
+            expedited_pct = mean(expedited)) %>% 
+  ungroup()
+
+#### Try modeling at three months
+mod_percentage_sales <- lm(sales_diff ~ late_pct + expedited_pct, data = mod_data_quarter)
+summary(mod_percentage_sales)
+
+mod_diff_logged_sales = lm(sales_returns ~ late_pct + expedited_pct, data = mod_data_quarter)
+
+summary(mod_diff_logged_sales) 
+
+mod_logged_sales = lm(logSales ~ late_pct + expedited_pct, data = mod_data_quarter)
+
+summary(mod_logged_sales)
+
+#############################################
+# Try to get ROC an AUC
+#############################################
+
+## Create 
+trust_model = mod_data %>%
+  rowwise() %>%
+  mutate(trust = mean(c_across(late_pct:expedited_pct))) %>%
+  mutate(trust_1 = mean(c_across(late_pct_1:expedited_pct_1))) %>%
+  mutate(negative_sales_change = if_else(sales_diff <= 0,1, 0))
+trust_model
+
+roc_trust = roc(trust_model$negative_sales_change, trust_model$trust)
+roc_trust
+auc_trust = auc(roc_trust)
+auc_trust
+
+roc_trust_1 = roc(trust_model$negative_sales_change, trust_model$trust_1)
+auc_trust_1 = auc(roc_trust_1)
+auc_trust_1
+
+cor(trust_model$sales_diff, trust_model$trust_1)
+
+
+## Change everything at zero or less to one, because lo
+
+
+
+
+plot(late_mod)
+
+late_mod_big <- lm(sales_returns ~ late_pct_1 + late_pct_2 + late_pct_3 +
+                     expedited_pct_1 + expedited_pct_2 + expedited_pct_3, data = mod_data)
+summary(late_mod_big)
+
+# errybody
+late_mod_big_diff <- lm(sales_diff ~ late_pct_1 + late_pct_2 + late_pct_3 +
+                     expedited_pct_1 + expedited_pct_2 + expedited_pct_3, data = mod_data)
+summary(late_mod_big_diff)
+
+late_mod_big_log <- lm(logSales ~ late_pct_1 + late_pct_2 + late_pct_3 +
+                          expedited_pct_1 + expedited_pct_2 + expedited_pct_3, data = mod_data)
+summary(late_mod_big_log)
+
+
+ggplot(data = mod_data %>% sample_n(2000), aes(x = late_pct_1, y = sales_returns)) + geom_point(aes(alpha = .2))
+ggplot(mod_data %>% sample_n(2000) , aes(x = late_pct_1, y = sales_diff)) + geom_point(aes(alpha = .2))
+
+# multi - level
+
+# other things: 6months effects following month how?
+# live v dead custs, logistic reg churn
+# sales pct diff you could do also
+
+
+
+
+saveRDS(cval, glue("{communal_data_dir}/trust_data/customer_cumulative_value.RDS"))
